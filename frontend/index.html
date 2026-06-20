@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>网络流量分析器 - Network Traffic Analyzer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="logo">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+          </svg>
+        </div>
+        <div class="logo-text">
+          <h1>NetFlow<span>Analyzer</span></h1>
+          <p class="subtitle">实时网络流量拓扑分析</p>
+        </div>
+      </div>
+
+      <div class="stats">
+        <div class="stat-item">
+          <span class="stat-label">活跃流</span>
+          <span class="stat-value" id="stat-flows">0</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">IP节点</span>
+          <span class="stat-value" id="stat-ips">0</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">总字节</span>
+          <span class="stat-value" id="stat-bytes">0</span>
+        </div>
+        <div class="stat-item">
+          <span class="stat-label">总包数</span>
+          <span class="stat-value" id="stat-packets">0</span>
+        </div>
+      </div>
+
+      <div class="status-indicator" id="connection-status">
+        <span class="status-dot"></span>
+        <span class="status-text">连接中...</span>
+      </div>
+    </header>
+
+    <div class="time-control">
+      <div class="time-info">
+        <span class="time-label">时间窗口</span>
+        <span class="time-range" id="time-range-display">--</span>
+      </div>
+      <div class="slider-container">
+        <div class="slider-track" id="slider-track">
+          <div class="slider-fill" id="slider-fill"></div>
+          <div class="slider-handle left" id="handle-left" draggable="true"></div>
+          <div class="slider-handle right" id="handle-right" draggable="true"></div>
+          <div class="slider-range" id="slider-range"></div>
+        </div>
+        <div class="slider-labels">
+          <span id="time-start">--:--:--</span>
+          <span id="time-end">--:--:--</span>
+        </div>
+      </div>
+      <div class="time-presets">
+        <button class="preset-btn" data-minutes="1">1分钟</button>
+        <button class="preset-btn active" data-minutes="5">5分钟</button>
+        <button class="preset-btn" data-minutes="15">15分钟</button>
+        <button class="preset-btn" data-minutes="30">30分钟</button>
+        <button class="preset-btn" data-minutes="60">1小时</button>
+      </div>
+    </div>
+
+    <div class="main-content">
+      <div class="canvas-container">
+        <svg id="topology-svg"></svg>
+        <div class="tooltip" id="tooltip"></div>
+        <div class="legend">
+          <h3>协议图例</h3>
+          <div class="legend-items">
+            <div class="legend-item">
+              <div class="legend-color" style="background: #ff6b6b"></div>
+              <span>TCP</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-color" style="background: #4ecdc4"></div>
+              <span>UDP</span>
+            </div>
+            <div class="legend-item">
+              <div class="legend-color" style="background: #ffe66d"></div>
+              <span>ICMP</span>
+            </div>
+          </div>
+          <h3 style="margin-top: 16px">流量粗细</h3>
+          <div class="traffic-scale">
+            <div class="scale-line" style="width: 2px"></div>
+            <span>小</span>
+            <div class="scale-line" style="width: 6px"></div>
+            <span>中</span>
+            <div class="scale-line" style="width: 12px"></div>
+            <span>大</span>
+          </div>
+        </div>
+      </div>
+
+      <aside class="detail-panel" id="detail-panel">
+        <div class="panel-header">
+          <h2>流详情</h2>
+          <button class="close-btn" id="close-panel">×</button>
+        </div>
+        <div class="panel-content" id="panel-content">
+          <div class="empty-state">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+            </svg>
+            <p>点击节点或连线查看详情</p>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="grid-bg"></div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
