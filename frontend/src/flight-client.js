@@ -18,8 +18,14 @@ export class FlowFlightClient {
       connect: [],
       disconnect: [],
       error: [],
-      timeRange: []
+      timeRange: [],
+      streamStart: [],
+      streamPage: [],
+      streamEnd: []
     };
+    this._currentStream = null;
+    this._pendingFlows = [];
+    this._streamBuffer = [];
   }
 
   async connect() {
@@ -28,6 +34,7 @@ export class FlowFlightClient {
       console.log(`[FlightClient] Connecting to ${wsUrl}`);
 
       this.ws = new WebSocket(wsUrl);
+      this.ws.binaryType = 'arraybuffer';
 
       this.ws.onopen = () => {
         console.log('[FlightClient] WebSocket connected');
@@ -38,13 +45,13 @@ export class FlowFlightClient {
 
       this.ws.onmessage = async (event) => {
         try {
-          if (event.data instanceof Blob) {
+          if (event.data instanceof ArrayBuffer) {
+            const uint8 = new Uint8Array(event.data);
+            await this._handleBinary(uint8);
+          } else if (event.data instanceof Blob) {
             const buffer = await event.data.arrayBuffer();
             const uint8 = new Uint8Array(buffer);
-            const reader = Arrow.RecordBatchReader.from(uint8);
-            for await (const batch of reader) {
-              this._handleRecordBatch(batch);
-            }
+            await this._handleBinary(uint8);
           } else {
             const message = JSON.parse(event.data);
             this._handleMessage(message);
@@ -176,6 +183,69 @@ export class FlowFlightClient {
       this._emit('timeRange', message.data);
     } else if (message.type === 'time_window_response') {
       console.log('[FlightClient] Time window updated:', message.data);
+    } else if (message.type === 'stream_start') {
+      this._handleStreamStart(message);
+    } else if (message.type === 'stream_page') {
+      this._handleStreamPage(message);
+    } else if (message.type === 'stream_end') {
+      this._handleStreamEnd(message);
+    }
+  }
+
+  _handleStreamStart(message) {
+    this._currentStream = {
+      streamId: message.stream_id,
+      totalRows: message.total_rows,
+      totalPages: message.total_pages,
+      pageSize: message.page_size,
+      pagesReceived: 0,
+      flows: []
+    };
+    this._streamBuffer = [];
+    console.log(`[FlightClient] Stream start: ${message.stream_id}, total: ${message.total_rows} rows, ${message.total_pages} pages`);
+    this._emit('streamStart', {
+      streamId: message.stream_id,
+      totalRows: message.total_rows,
+      totalPages: message.total_pages
+    });
+  }
+
+  _handleStreamPage(message) {
+    if (this._currentStream) {
+      this._currentStream.pagesReceived = message.page_index;
+    }
+    this._emit('streamPage', {
+      streamId: message.stream_id,
+      pageIndex: message.page_index,
+      totalPages: message.total_pages,
+      rowsInPage: message.rows_in_page
+    });
+  }
+
+  async _handleStreamEnd(message) {
+    if (this._currentStream) {
+      console.log(`[FlightClient] Stream end: ${message.stream_id}, sent ${message.pages_sent} pages, collected ${this._currentStream.flows.length} flows`);
+      const allFlows = [...this._currentStream.flows];
+      this._emit('streamEnd', {
+        streamId: message.stream_id,
+        pagesSent: message.pages_sent,
+        totalFlows: allFlows.length
+      });
+      if (allFlows.length > 0) {
+        this._emit('data', allFlows);
+      }
+      this._currentStream = null;
+    }
+  }
+
+  async _handleBinary(uint8) {
+    try {
+      const reader = Arrow.RecordBatchReader.from(uint8);
+      for await (const batch of reader) {
+        this._handleRecordBatch(batch);
+      }
+    } catch (e) {
+      console.warn('[FlightClient] Binary parse error (might be partial stream):', e.message);
     }
   }
 
@@ -200,7 +270,11 @@ export class FlowFlightClient {
       });
     }
 
-    this._emit('data', flows);
+    if (this._currentStream) {
+      this._currentStream.flows.push(...flows);
+    }
+
+    this._emit('dataPartial', flows);
   }
 
   on(event, handler) {

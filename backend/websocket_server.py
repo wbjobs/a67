@@ -3,13 +3,15 @@ import asyncio
 import threading
 import time
 import websockets
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Generator
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.ipc as ipc
 
 from arrow_store import ArrowStore
 from filter import TimeWindowFilter
+
+PAGE_SIZE = 1000
 
 
 class WebSocketBridge:
@@ -33,7 +35,8 @@ class WebSocketBridge:
             'id': client_id,
             'time_window': None,
             'websocket': websocket,
-            'last_update': 0
+            'last_update': 0,
+            'last_data_version': -1
         }
 
         with self._client_lock:
@@ -47,7 +50,7 @@ class WebSocketBridge:
                 'client_id': client_id
             })
 
-            await self._push_initial_data(websocket, client_config)
+            await self._push_initial_data_stream(websocket, client_config)
 
             async for message in websocket:
                 try:
@@ -88,14 +91,16 @@ class WebSocketBridge:
                     'status': 'ok',
                     'flows_in_window': filtered.num_rows,
                     'total_bytes': int(pc.sum(filtered['byte_count']).as_py()) if filtered.num_rows > 0 else 0,
-                    'total_packets': int(pc.sum(filtered['packet_count']).as_py()) if filtered.num_rows > 0 else 0
+                    'total_packets': int(pc.sum(filtered['packet_count']).as_py()) if filtered.num_rows > 0 else 0,
+                    'page_size': PAGE_SIZE,
+                    'total_pages': (filtered.num_rows + PAGE_SIZE - 1) // PAGE_SIZE
                 }
                 await self._send_message(client_config['websocket'], {
                     'type': 'time_window_response',
                     'data': response
                 })
 
-                await self._push_filtered_data(client_config)
+                await self._push_filtered_data_stream(client_config)
 
             elif action == 'get_stats':
                 table = self._store.get_table()
@@ -158,19 +163,69 @@ class WebSocketBridge:
         except Exception as e:
             print(f"[WSBridge] Send message error: {e}")
 
-    async def _send_record_batch(self, websocket, table: pa.Table):
+    def _page_generator(self, table: pa.Table) -> Generator[pa.RecordBatch, None, None]:
+        total_rows = table.num_rows
+        if total_rows == 0:
+            return
+
+        for offset in range(0, total_rows, PAGE_SIZE):
+            end = min(offset + PAGE_SIZE, total_rows)
+            page_table = table.slice(offset, end - offset)
+            if page_table.num_rows > 0:
+                for batch in page_table.to_batches(max_chunksize=PAGE_SIZE):
+                    yield batch
+
+    async def _stream_record_batches(self, websocket, table: pa.Table, stream_id: str = None):
         try:
-            sink = pa.BufferOutputStream()
-            with ipc.new_stream(sink, table.schema) as writer:
-                for batch in table.to_batches(max_chunksize=1000):
+            total_rows = table.num_rows
+            total_pages = (total_rows + PAGE_SIZE - 1) // PAGE_SIZE if total_rows > 0 else 0
+
+            await self._send_message(websocket, {
+                'type': 'stream_start',
+                'stream_id': stream_id,
+                'total_rows': total_rows,
+                'total_pages': total_pages,
+                'page_size': PAGE_SIZE
+            })
+
+            if total_rows == 0:
+                await self._send_message(websocket, {
+                    'type': 'stream_end',
+                    'stream_id': stream_id,
+                    'pages_sent': 0
+                })
+                return
+
+            pages_sent = 0
+            for batch in self._page_generator(table):
+                sink = pa.BufferOutputStream()
+                with ipc.new_stream(sink, table.schema) as writer:
                     writer.write_batch(batch)
 
-            buffer = sink.getvalue()
-            await websocket.send(buffer.to_pybytes())
+                buffer = sink.getvalue()
+                await websocket.send(buffer.to_pybytes())
+                pages_sent += 1
+
+                await self._send_message(websocket, {
+                    'type': 'stream_page',
+                    'stream_id': stream_id,
+                    'page_index': pages_sent,
+                    'total_pages': total_pages,
+                    'rows_in_page': batch.num_rows
+                })
+
+            await self._send_message(websocket, {
+                'type': 'stream_end',
+                'stream_id': stream_id,
+                'pages_sent': pages_sent
+            })
+
+        except websockets.exceptions.ConnectionClosed:
+            pass
         except Exception as e:
-            print(f"[WSBridge] Send record batch error: {e}")
+            print(f"[WSBridge] Stream record batches error: {e}")
 
-    async def _push_initial_data(self, websocket, client_config: dict):
+    async def _push_initial_data_stream(self, websocket, client_config: dict):
         table = self._store.get_table()
         if client_config['time_window']:
             table = TimeWindowFilter.filter_by_time(
@@ -178,10 +233,10 @@ class WebSocketBridge:
                 client_config['time_window'][0],
                 client_config['time_window'][1]
             )
-        if table.num_rows > 0:
-            await self._send_record_batch(websocket, table)
+        stream_id = f"init_{int(time.time() * 1000)}"
+        await self._stream_record_batches(websocket, table, stream_id)
 
-    async def _push_filtered_data(self, client_config: dict):
+    async def _push_filtered_data_stream(self, client_config: dict):
         table = self._store.get_table()
         if client_config['time_window']:
             table = TimeWindowFilter.filter_by_time(
@@ -189,8 +244,8 @@ class WebSocketBridge:
                 client_config['time_window'][0],
                 client_config['time_window'][1]
             )
-        if table.num_rows > 0:
-            await self._send_record_batch(client_config['websocket'], table)
+        stream_id = f"filter_{int(time.time() * 1000)}"
+        await self._stream_record_batches(client_config['websocket'], table, stream_id)
 
     def _run_async(self, coro):
         if self._loop and self._loop.is_running():
@@ -223,7 +278,10 @@ class WebSocketBridge:
                                 client['time_window'][1]
                             )
                         if filtered.num_rows > 0:
-                            self._run_async(self._send_record_batch(client['websocket'], filtered))
+                            stream_id = f"push_{int(time.time() * 1000)}_{client['id']}"
+                            self._run_async(self._stream_record_batches(
+                                client['websocket'], filtered, stream_id
+                            ))
                     except Exception as e:
                         print(f"[WSBridge] Push to client error: {e}")
 

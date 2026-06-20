@@ -1,4 +1,5 @@
 import * as d3 from 'd3';
+import ForceWorker from './force-worker.js?worker';
 
 const PROTOCOL_COLORS = {
   'TCP': '#ff6b6b',
@@ -23,16 +24,26 @@ export class TopologyGraph {
     this.links = [];
     this.nodeMap = new Map();
     this.linkMap = new Map();
-    this.simulation = null;
+    this.worker = null;
+    this.nodePositionMap = new Map();
+    this.linkPositionMap = new Map();
     this.onNodeClick = null;
     this.onLinkClick = null;
+    this.renderFrameId = null;
+    this.pendingRender = false;
+    this.alpha = 1;
 
     this._init();
   }
 
   _init() {
     this._updateSize();
-    window.addEventListener('resize', () => this._updateSize());
+    window.addEventListener('resize', () => {
+      this._updateSize();
+      if (this.worker) {
+        this.worker.postMessage({ type: 'updateSize', data: { width: this.width, height: this.height } });
+      }
+    });
 
     this.defs = this.svg.append('defs');
 
@@ -41,7 +52,7 @@ export class TopologyGraph {
     this.gLabel = this.svg.append('g').attr('class', 'labels');
 
     this._createDefs();
-    this._initSimulation();
+    this._initWorker();
   }
 
   _createDefs() {
@@ -90,27 +101,105 @@ export class TopologyGraph {
     this.width = container.clientWidth;
     this.height = container.clientHeight;
     this.svg.attr('viewBox', [0, 0, this.width, this.height]);
-
-    if (this.simulation) {
-      this.simulation
-        .force('center', d3.forceCenter(this.width / 2, this.height / 2))
-        .force('x', d3.forceX(this.width / 2).strength(0.05))
-        .force('y', d3.forceY(this.height / 2).strength(0.05))
-        .alpha(0.3)
-        .restart();
-    }
   }
 
-  _initSimulation() {
-    this.simulation = d3.forceSimulation(this.nodes)
-      .force('link', d3.forceLink(this.links).id(d => d.id).distance(120).strength(0.6))
-      .force('charge', d3.forceManyBody().strength(-400))
-      .force('center', d3.forceCenter(this.width / 2, this.height / 2))
-      .force('x', d3.forceX(this.width / 2).strength(0.05))
-      .force('y', d3.forceY(this.height / 2).strength(0.05))
-      .force('collision', d3.forceCollide().radius(40))
-      .alphaDecay(0.02)
-      .on('tick', () => this._tick());
+  _initWorker() {
+    this.worker = new ForceWorker();
+
+    this.worker.onmessage = (event) => {
+      const { type, data } = event.data;
+      if (type === 'tick') {
+        this._handleWorkerTick(data);
+      }
+    };
+  }
+
+  _handleWorkerTick(data) {
+    this.alpha = data.alpha;
+
+    data.nodes.forEach(n => {
+      this.nodePositionMap.set(n.id, { x: n.x, y: n.y, vx: n.vx, vy: n.vy, fx: n.fx, fy: n.fy });
+      const node = this.nodeMap.get(n.id);
+      if (node) {
+        node.x = n.x;
+        node.y = n.y;
+        node.vx = n.vx;
+        node.vy = n.vy;
+        node.fx = n.fx;
+        node.fy = n.fy;
+      }
+    });
+
+    data.links.forEach(l => {
+      this.linkPositionMap.set(l.id, { sourceX: l.sourceX, sourceY: l.sourceY, targetX: l.targetX, targetY: l.targetY });
+      const link = this.linkMap.get(l.id);
+      if (link) {
+        if (typeof link.source === 'object') {
+          link.source.x = l.sourceX;
+          link.source.y = l.sourceY;
+        }
+        if (typeof link.target === 'object') {
+          link.target.x = l.targetX;
+          link.target.y = l.targetY;
+        }
+      }
+    });
+
+    this._scheduleRender();
+  }
+
+  _scheduleRender() {
+    if (this.pendingRender) return;
+    this.pendingRender = true;
+
+    this.renderFrameId = requestAnimationFrame(() => {
+      this.pendingRender = false;
+      this._tickRender();
+    });
+  }
+
+  _tickRender() {
+    this.gLink.selectAll('line')
+      .attr('x1', d => {
+        const pos = this.linkPositionMap.get(d.id);
+        return pos ? pos.sourceX : (typeof d.source === 'object' ? d.source.x : 0);
+      })
+      .attr('y1', d => {
+        const pos = this.linkPositionMap.get(d.id);
+        return pos ? pos.sourceY : (typeof d.source === 'object' ? d.source.y : 0);
+      })
+      .attr('x2', d => {
+        const pos = this.linkPositionMap.get(d.id);
+        return pos ? pos.targetX : (typeof d.target === 'object' ? d.target.x : 0);
+      })
+      .attr('y2', d => {
+        const pos = this.linkPositionMap.get(d.id);
+        return pos ? pos.targetY : (typeof d.target === 'object' ? d.target.y : 0);
+      });
+
+    this.gNode.selectAll('g.node')
+      .attr('transform', d => {
+        const pos = this.nodePositionMap.get(d.id);
+        const x = pos ? pos.x : d.x || 0;
+        const y = pos ? pos.y : d.y || 0;
+        return `translate(${x},${y})`;
+      });
+
+    this.gLabel.selectAll('text.link-label')
+      .attr('x', d => {
+        const pos = this.linkPositionMap.get(d.id);
+        if (pos) return (pos.sourceX + pos.targetX) / 2;
+        const sx = typeof d.source === 'object' ? d.source.x : 0;
+        const tx = typeof d.target === 'object' ? d.target.x : 0;
+        return (sx + tx) / 2;
+      })
+      .attr('y', d => {
+        const pos = this.linkPositionMap.get(d.id);
+        if (pos) return (pos.sourceY + pos.targetY) / 2;
+        const sy = typeof d.source === 'object' ? d.source.y : 0;
+        const ty = typeof d.target === 'object' ? d.target.y : 0;
+        return (sy + ty) / 2;
+      });
   }
 
   updateData(flows) {
@@ -173,6 +262,18 @@ export class TopologyGraph {
     this.linkMap = newLinkMap;
 
     this._updateVisualization();
+
+    if (this.worker) {
+      this.worker.postMessage({
+        type: 'updateData',
+        data: {
+          nodes: this.nodes.map(n => ({ id: n.id })),
+          links: this.links.map(l => ({ id: l.id, source: l.source, target: l.target })),
+          width: this.width,
+          height: this.height
+        }
+      });
+    }
   }
 
   _getEdgeKey(src, dst) {
@@ -192,14 +293,9 @@ export class TopologyGraph {
   }
 
   _updateVisualization() {
-    this.simulation.nodes(this.nodes);
-    this.simulation.force('link').links(this.links);
-
     this._updateLinks();
     this._updateNodes();
     this._updateLabels();
-
-    this.simulation.alpha(0.5).restart();
   }
 
   _updateLinks() {
@@ -333,34 +429,28 @@ export class TopologyGraph {
     const self = this;
     return d3.drag()
       .on('start', function(event, d) {
-        if (!event.active) self.simulation.alphaTarget(0.3).restart();
-        d.fx = d.x;
-        d.fy = d.y;
-      })
-      .on('drag', function(event, d) {
+        if (self.worker) {
+          self.worker.postMessage({ type: 'fixNode', data: { id: d.id, fx: event.x, fy: event.y } });
+        }
         d.fx = event.x;
         d.fy = event.y;
       })
+      .on('drag', function(event, d) {
+        if (self.worker) {
+          self.worker.postMessage({ type: 'fixNode', data: { id: d.id, fx: event.x, fy: event.y } });
+        }
+        d.fx = event.x;
+        d.fy = event.y;
+        self.nodePositionMap.set(d.id, { x: event.x, y: event.y, fx: event.x, fy: event.y });
+        self._scheduleRender();
+      })
       .on('end', function(event, d) {
-        if (!event.active) self.simulation.alphaTarget(0);
+        if (self.worker) {
+          self.worker.postMessage({ type: 'releaseNode', data: { id: d.id } });
+        }
         d.fx = null;
         d.fy = null;
       });
-  }
-
-  _tick() {
-    this.gLink.selectAll('line')
-      .attr('x1', d => d.source.x)
-      .attr('y1', d => d.source.y)
-      .attr('x2', d => d.target.x)
-      .attr('y2', d => d.target.y);
-
-    this.gNode.selectAll('g.node')
-      .attr('transform', d => `translate(${d.x},${d.y})`);
-
-    this.gLabel.selectAll('text.link-label')
-      .attr('x', d => (d.source.x + d.target.x) / 2)
-      .attr('y', d => (d.source.y + d.target.y) / 2);
   }
 
   _showNodeTooltip(event, node) {
@@ -389,8 +479,10 @@ export class TopologyGraph {
   }
 
   _showLinkTooltip(event, link) {
+    const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+    const dstId = typeof link.target === 'object' ? link.target.id : link.target;
     const html = `
-      <h4>${link.source.id} ↔ ${link.target.id}</h4>
+      <h4>${srcId} ↔ ${dstId}</h4>
       <div class="tooltip-row">
         <span class="label">协议</span>
         <span class="value" style="color: ${PROTOCOL_COLORS[link.protocol]}">${link.protocol}</span>
@@ -451,6 +543,17 @@ export class TopologyGraph {
       totalBytes: this.links.reduce((sum, l) => sum + l.totalBytes, 0),
       totalPackets: this.links.reduce((sum, l) => sum + l.totalPackets, 0)
     };
+  }
+
+  destroy() {
+    if (this.renderFrameId) {
+      cancelAnimationFrame(this.renderFrameId);
+    }
+    if (this.worker) {
+      this.worker.postMessage({ type: 'stop' });
+      this.worker.terminate();
+      this.worker = null;
+    }
   }
 }
 

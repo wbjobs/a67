@@ -4,11 +4,13 @@ import threading
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.flight as flight
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Generator
 from collections import defaultdict
 
 from arrow_store import ArrowStore
 from filter import TimeWindowFilter
+
+PAGE_SIZE = 1000
 
 
 class FlowFlightServer(flight.FlightServerBase):
@@ -63,6 +65,18 @@ class FlowFlightServer(flight.FlightServerBase):
         min_bytes = client_config.get('min_bytes', 0)
         return TimeWindowFilter.apply_filters(table, time_window, protocols, min_bytes)
 
+    def _page_generator(self, table: pa.Table) -> Generator[pa.RecordBatch, None, None]:
+        total_rows = table.num_rows
+        if total_rows == 0:
+            return
+
+        for offset in range(0, total_rows, PAGE_SIZE):
+            end = min(offset + PAGE_SIZE, total_rows)
+            page_table = table.slice(offset, end - offset)
+            if page_table.num_rows > 0:
+                for batch in page_table.to_batches(max_chunksize=PAGE_SIZE):
+                    yield batch
+
     def do_get(self, context, ticket: flight.Ticket):
         client_id = ticket.ticket.decode('utf-8')
 
@@ -84,8 +98,7 @@ class FlowFlightServer(flight.FlightServerBase):
                 try:
                     filtered_table = self._get_filtered_data(client_config)
                     if filtered_table.num_rows > 0:
-                        batches = filtered_table.to_batches(max_chunksize=1000)
-                        for batch in batches:
+                        for batch in self._page_generator(filtered_table):
                             yield batch
 
                     self._last_push_time[client_id] = self._store.last_updated
@@ -96,7 +109,8 @@ class FlowFlightServer(flight.FlightServerBase):
                     break
 
         schema = self._store.get_schema()
-        return flight.GeneratorStream(schema, data_generator())
+        reader = flight.RecordBatchStream(schema, data_generator())
+        return flight.FlightDataStream(reader, schema)
 
     def do_put(self, context, descriptor, reader, writer):
         raise NotImplementedError("Put not supported")
@@ -138,6 +152,7 @@ class FlowFlightServer(flight.FlightServerBase):
                 'client_id': client_id,
                 'schema': self._store.get_schema().to_string(),
                 'total_flows': self._store.count(),
+                'page_size': PAGE_SIZE
             }
             yield flight.Result(json.dumps(result).encode('utf-8'))
 
@@ -160,6 +175,8 @@ class FlowFlightServer(flight.FlightServerBase):
                     'flows_in_window': filtered.num_rows,
                     'total_bytes': int(pc.sum(filtered['byte_count']).as_py()) if filtered.num_rows > 0 else 0,
                     'total_packets': int(pc.sum(filtered['packet_count']).as_py()) if filtered.num_rows > 0 else 0,
+                    'page_size': PAGE_SIZE,
+                    'total_pages': (filtered.num_rows + PAGE_SIZE - 1) // PAGE_SIZE
                 }
                 yield flight.Result(json.dumps(result).encode('utf-8'))
 

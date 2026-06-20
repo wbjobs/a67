@@ -15,6 +15,11 @@ class App {
     this.graph = null;
     this.timeSlider = null;
     this.currentFlows = [];
+    this.flowMap = new Map();
+    this.streamInfo = null;
+    this.incrementalUpdateTimer = null;
+    this.pendingFlows = [];
+    this.INCREMENTAL_INTERVAL = 200;
     this._init();
   }
 
@@ -43,6 +48,24 @@ class App {
     this.detailPanel = document.getElementById('detail-panel');
     this.panelContent = document.getElementById('panel-content');
     this.closePanelBtn = document.getElementById('close-panel');
+    this.streamProgress = document.createElement('div');
+    this.streamProgress.id = 'stream-progress';
+    this.streamProgress.style.cssText = `
+      position: fixed;
+      top: 80px;
+      right: 20px;
+      background: rgba(10, 14, 23, 0.9);
+      border: 1px solid #1e2a3a;
+      border-radius: 8px;
+      padding: 10px 16px;
+      color: #00d4ff;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      z-index: 1000;
+      display: none;
+      backdrop-filter: blur(10px);
+    `;
+    document.body.appendChild(this.streamProgress);
   }
 
   _initGraph() {
@@ -102,9 +125,46 @@ class App {
       this._updateConnectionStatus('disconnected');
     });
 
+    this.client.on('streamStart', (info) => {
+      this.streamInfo = { ...info, received: 0 };
+      this._showStreamProgress();
+      this.flowMap.clear();
+      this.pendingFlows = [];
+    });
+
+    this.client.on('streamPage', (info) => {
+      if (this.streamInfo) {
+        this.streamInfo.received = info.pageIndex;
+        this._updateStreamProgress();
+      }
+    });
+
+    this.client.on('dataPartial', (flows) => {
+      flows.forEach(flow => {
+        this.flowMap.set(flow.flow_id, flow);
+      });
+      this.pendingFlows.push(...flows);
+
+      if (!this.incrementalUpdateTimer) {
+        this.incrementalUpdateTimer = setTimeout(() => {
+          this._flushIncrementalUpdate();
+        }, this.INCREMENTAL_INTERVAL);
+      }
+    });
+
+    this.client.on('streamEnd', (info) => {
+      if (this.incrementalUpdateTimer) {
+        clearTimeout(this.incrementalUpdateTimer);
+        this.incrementalUpdateTimer = null;
+      }
+      this._flushIncrementalUpdate();
+      this._hideStreamProgress();
+      console.log(`[App] Stream complete: ${info.totalFlows} flows received`);
+      this.streamInfo = null;
+    });
+
     this.client.on('data', (flows) => {
       this.currentFlows = flows;
-      this.graph.updateData(flows);
       this._updateStatsFromFlows(flows);
     });
 
@@ -118,6 +178,49 @@ class App {
     });
 
     await this.client.connect();
+  }
+
+  _flushIncrementalUpdate() {
+    if (this.pendingFlows.length === 0) {
+      this.incrementalUpdateTimer = null;
+      return;
+    }
+
+    const allFlows = Array.from(this.flowMap.values());
+    this.currentFlows = allFlows;
+    this.graph.updateData(allFlows);
+    this._updateStatsFromFlows(allFlows);
+    this.pendingFlows = [];
+    this.incrementalUpdateTimer = null;
+  }
+
+  _showStreamProgress() {
+    if (!this.streamInfo) return;
+    const { totalRows, totalPages } = this.streamInfo;
+    this.streamProgress.innerHTML = `
+      <div style="font-weight: bold; margin-bottom: 4px;">📡 数据加载中</div>
+      <div>总行数: <span style="color: #fff;">${totalRows.toLocaleString()}</span></div>
+      <div>已接收: <span id="progress-pages">0</span> / ${totalPages} 页</div>
+      <div style="margin-top: 6px; background: #1e2a3a; height: 4px; border-radius: 2px; overflow: hidden;">
+        <div id="progress-bar" style="height: 100%; background: linear-gradient(90deg, #00d4ff, #00ff88); width: 0%; transition: width 0.3s;"></div>
+      </div>
+    `;
+    this.streamProgress.style.display = 'block';
+  }
+
+  _updateStreamProgress() {
+    if (!this.streamInfo) return;
+    const { received, totalPages } = this.streamInfo;
+    const pagesEl = document.getElementById('progress-pages');
+    const barEl = document.getElementById('progress-bar');
+    if (pagesEl) pagesEl.textContent = received;
+    if (barEl) barEl.style.width = `${(received / totalPages) * 100}%`;
+  }
+
+  _hideStreamProgress() {
+    setTimeout(() => {
+      this.streamProgress.style.display = 'none';
+    }, 500);
   }
 
   _updateConnectionStatus(status) {
@@ -210,10 +313,12 @@ class App {
 
   _showLinkDetail(link) {
     const flows = link.flows.sort((a, b) => b.byte_count - a.byte_count);
+    const srcId = typeof link.source === 'object' ? link.source.id : link.source;
+    const dstId = typeof link.target === 'object' ? link.target.id : link.target;
 
     const html = `
       <div class="flow-detail">
-        <h3>${link.source.id} ↔ ${link.target.id}</h3>
+        <h3>${srcId} ↔ ${dstId}</h3>
         <div class="detail-row">
           <span class="label">协议</span>
           <span class="value ${link.protocol.toLowerCase()}">${link.protocol}</span>
