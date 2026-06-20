@@ -9,12 +9,14 @@ from packet_capture import PacketCapture
 from arrow_store import ArrowStore
 from flight_server import FlowFlightServer, run_server
 from websocket_server import WebSocketBridge
+from anomaly_detector import AnomalyDetector
 
 
 def main():
     store = ArrowStore()
     aggregator = FlowAggregator()
     capture = PacketCapture()
+    detector = AnomalyDetector(window_size=10, sigma_threshold=3.0, min_flows_for_detection=5)
 
     print("[Main] ========================================")
     print("[Main] 网络流量分析器 - Network Flow Analyzer")
@@ -36,13 +38,18 @@ def main():
     def on_packet(packet):
         flow = aggregator.process_packet(packet)
         store.update_flow(flow)
+        detector.process_flow({
+            'src_ip': flow.src_ip,
+            'dst_ip': flow.dst_ip,
+            'dst_port': flow.dst_port
+        })
 
     capture.set_callback(on_packet)
     capture.start_mock_capture(packets_per_second=30)
     print("[Main] 模拟抓包已启动 (30包/秒)")
     print()
 
-    ws_bridge = WebSocketBridge(store, host="localhost", port=8815)
+    ws_bridge = WebSocketBridge(store, host="localhost", port=8815, anomaly_detector=detector)
     ws_bridge.start()
     print(f"[Main] WebSocket 桥接服务已启动: ws://localhost:8815")
     print()
@@ -67,10 +74,11 @@ def main():
         while True:
             time.sleep(1)
             stats = store.get_table()
+            anomaly_stats = detector.get_stats()
             if stats.num_rows > 0:
                 total_bytes = int(pc.sum(stats['byte_count']).as_py())
                 total_packets = int(pc.sum(stats['packet_count']).as_py())
-                print(f"\r[Main] 实时流数: {store.count()} | 字节: {format_bytes(total_bytes)} | 包数: {total_packets}", end='', flush=True)
+                print(f"\r[Main] 实时流数: {store.count()} | 字节: {format_bytes(total_bytes)} | 包数: {total_packets} | 可疑IP: {anomaly_stats['total_suspicious_ips']}", end='', flush=True)
     except KeyboardInterrupt:
         handle_shutdown(None, None)
 

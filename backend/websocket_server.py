@@ -10,22 +10,27 @@ import pyarrow.ipc as ipc
 
 from arrow_store import ArrowStore
 from filter import TimeWindowFilter
+from anomaly_detector import AnomalyDetector
 
 PAGE_SIZE = 1000
 
 
 class WebSocketBridge:
-    def __init__(self, arrow_store: ArrowStore, host: str = "localhost", port: int = 8815):
+    def __init__(self, arrow_store: ArrowStore, host: str = "localhost", port: int = 8815,
+                 anomaly_detector: AnomalyDetector = None):
         self._store = arrow_store
         self._host = host
         self._port = port
+        self._detector = anomaly_detector or AnomalyDetector()
         self._clients: Dict[str, dict] = {}
         self._client_lock = threading.RLock()
         self._running = False
         self._push_thread: Optional[threading.Thread] = None
         self._server_thread: Optional[threading.Thread] = None
         self._last_push = 0.0
+        self._last_anomaly_push = 0.0
         self._push_interval = 1.0
+        self._anomaly_push_interval = 1.0
         self._server = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -120,6 +125,37 @@ class WebSocketBridge:
                         'max_time': end,
                         'total_flows': table.num_rows
                     }
+                })
+
+            elif action == 'get_anomaly_stats':
+                stats = self._detector.get_stats()
+                suspicious = self._detector.get_suspicious_ips()
+                alerts = self._detector.get_alerts(50)
+                await self._send_message(client_config['websocket'], {
+                    'type': 'anomaly_stats',
+                    'data': {
+                        'stats': stats,
+                        'suspicious_ips': suspicious,
+                        'alerts': alerts
+                    }
+                })
+
+            elif action == 'set_anomaly_threshold':
+                sigma = data.get('sigma_threshold')
+                window_size = data.get('window_size')
+                min_flows = data.get('min_flows_for_detection')
+
+                if sigma is not None:
+                    self._detector.set_sigma_threshold(float(sigma))
+                if window_size is not None:
+                    self._detector.set_window_size(int(window_size))
+                if min_flows is not None:
+                    self._detector.set_min_flows_for_detection(int(min_flows))
+
+                stats = self._detector.get_stats()
+                await self._send_message(client_config['websocket'], {
+                    'type': 'anomaly_threshold_updated',
+                    'data': stats
                 })
 
         except Exception as e:
@@ -251,41 +287,95 @@ class WebSocketBridge:
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(coro, self._loop)
 
+    def _process_flows_for_anomaly(self, table: pa.Table):
+        try:
+            src_ips = table['src_ip'].to_pylist()
+            dst_ips = table['dst_ip'].to_pylist()
+            dst_ports = table['dst_port'].to_pylist()
+
+            for i in range(table.num_rows):
+                flow = {
+                    'src_ip': src_ips[i],
+                    'dst_ip': dst_ips[i],
+                    'dst_port': int(dst_ports[i]) if dst_ports[i] else 0
+                }
+                self._detector.process_flow(flow)
+        except Exception as e:
+            print(f"[WSBridge] Process flows for anomaly error: {e}")
+
+    def _push_anomaly_updates(self):
+        try:
+            stats = self._detector.get_stats()
+            suspicious = self._detector.get_suspicious_ips()
+            alerts = self._detector.get_alerts(50)
+
+            with self._client_lock:
+                clients = list(self._clients.values())
+
+            for client in clients:
+                try:
+                    self._run_async(self._send_message(
+                        client['websocket'],
+                        {
+                            'type': 'anomaly_update',
+                            'data': {
+                                'stats': stats,
+                                'suspicious_ips': suspicious,
+                                'alerts': alerts
+                            }
+                        }
+                    ))
+                except Exception as e:
+                    print(f"[WSBridge] Push anomaly update error: {e}")
+        except Exception as e:
+            print(f"[WSBridge] Anomaly update error: {e}")
+
     def _push_loop(self):
         while self._running:
             try:
-                if self._store.last_updated <= self._last_push:
+                self._detector.tick()
+
+                if self._store.last_updated <= self._last_push and \
+                        time.time() - self._last_anomaly_push < self._anomaly_push_interval:
                     time.sleep(0.1)
                     continue
 
-                self._last_push = self._store.last_updated
+                now = time.time()
+                data_updated = self._store.last_updated > self._last_push
+                anomaly_updated = now - self._last_anomaly_push >= self._anomaly_push_interval
 
-                table = self._store.get_table()
-                if table.num_rows == 0:
-                    time.sleep(self._push_interval)
-                    continue
+                if data_updated:
+                    self._last_push = self._store.last_updated
 
-                with self._client_lock:
-                    clients = list(self._clients.values())
+                    table = self._store.get_table()
+                    if table.num_rows > 0:
+                        self._process_flows_for_anomaly(table)
 
-                for client in clients:
-                    try:
-                        filtered = table
-                        if client['time_window']:
-                            filtered = TimeWindowFilter.filter_by_time(
-                                table,
-                                client['time_window'][0],
-                                client['time_window'][1]
-                            )
-                        if filtered.num_rows > 0:
-                            stream_id = f"push_{int(time.time() * 1000)}_{client['id']}"
-                            self._run_async(self._stream_record_batches(
-                                client['websocket'], filtered, stream_id
-                            ))
-                    except Exception as e:
-                        print(f"[WSBridge] Push to client error: {e}")
+                        with self._client_lock:
+                            clients = list(self._clients.values())
 
-                time.sleep(self._push_interval)
+                        for client in clients:
+                            try:
+                                filtered = table
+                                if client['time_window']:
+                                    filtered = TimeWindowFilter.filter_by_time(
+                                        table,
+                                        client['time_window'][0],
+                                        client['time_window'][1]
+                                    )
+                                if filtered.num_rows > 0:
+                                    stream_id = f"push_{int(time.time() * 1000)}_{client['id']}"
+                                    self._run_async(self._stream_record_batches(
+                                        client['websocket'], filtered, stream_id
+                                    ))
+                            except Exception as e:
+                                print(f"[WSBridge] Push to client error: {e}")
+
+                if anomaly_updated:
+                    self._last_anomaly_push = now
+                    self._push_anomaly_updates()
+
+                time.sleep(min(self._push_interval, self._anomaly_push_interval))
 
             except Exception as e:
                 print(f"[WSBridge] Push loop error: {e}")

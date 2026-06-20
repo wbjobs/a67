@@ -9,14 +9,16 @@ from collections import defaultdict
 
 from arrow_store import ArrowStore
 from filter import TimeWindowFilter
+from anomaly_detector import AnomalyDetector
 
 PAGE_SIZE = 1000
 
 
 class FlowFlightServer(flight.FlightServerBase):
-    def __init__(self, location: str, arrow_store: ArrowStore):
+    def __init__(self, location: str, arrow_store: ArrowStore, anomaly_detector: AnomalyDetector = None):
         super().__init__(location)
         self._store = arrow_store
+        self._detector = anomaly_detector or AnomalyDetector()
         self._clients: Dict[str, Dict] = {}
         self._client_lock = threading.RLock()
         self._push_thread: Optional[threading.Thread] = None
@@ -113,7 +115,35 @@ class FlowFlightServer(flight.FlightServerBase):
         return flight.FlightDataStream(reader, schema)
 
     def do_put(self, context, descriptor, reader, writer):
-        raise NotImplementedError("Put not supported")
+        try:
+            descriptor_path = descriptor.path[0].decode('utf-8') if descriptor.path else ''
+
+            if descriptor_path == 'anomaly_threshold':
+                table = reader.read_all()
+                if table.num_rows > 0:
+                    row = table.to_pylist()[0]
+                    if 'sigma_threshold' in row:
+                        self._detector.set_sigma_threshold(float(row['sigma_threshold']))
+                    if 'window_size' in row:
+                        self._detector.set_window_size(int(row['window_size']))
+                    if 'min_flows_for_detection' in row:
+                        self._detector.set_min_flows_for_detection(int(row['min_flows_for_detection']))
+
+                stats = self._detector.get_stats()
+                result_table = pa.table([
+                    pa.array([stats['sigma_threshold']], type=pa.float64()),
+                    pa.array([stats['window_size']], type=pa.int32()),
+                    pa.array([stats['min_flows_for_detection']], type=pa.int32()),
+                    pa.array([stats['total_suspicious_ips']], type=pa.int32()),
+                ], names=['sigma_threshold', 'window_size', 'min_flows_for_detection', 'total_suspicious_ips'])
+
+                writer.write(result_table)
+                return
+
+            raise NotImplementedError(f"Unknown descriptor: {descriptor_path}")
+        except Exception as e:
+            print(f"[FlightServer] do_put error: {e}")
+            raise
 
     def list_flights(self, context, criteria):
         yield flight.FlightInfo(

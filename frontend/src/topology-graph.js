@@ -32,6 +32,8 @@ export class TopologyGraph {
     this.renderFrameId = null;
     this.pendingRender = false;
     this.alpha = 1;
+    this.suspiciousIps = new Map();
+    this.pulseTime = 0;
 
     this._init();
   }
@@ -47,12 +49,14 @@ export class TopologyGraph {
 
     this.defs = this.svg.append('defs');
 
+    this.gPulse = this.svg.append('g').attr('class', 'pulse-rings');
     this.gLink = this.svg.append('g').attr('class', 'links');
     this.gNode = this.svg.append('g').attr('class', 'nodes');
     this.gLabel = this.svg.append('g').attr('class', 'labels');
 
     this._createDefs();
     this._initWorker();
+    this._startPulseAnimation();
   }
 
   _createDefs() {
@@ -70,6 +74,31 @@ export class TopologyGraph {
     const feMerge = glowFilter.append('feMerge');
     feMerge.append('feMergeNode').attr('in', 'coloredBlur');
     feMerge.append('feMergeNode').attr('in', 'SourceGraphic');
+
+    const dangerGlowFilter = this.defs.append('filter')
+      .attr('id', 'danger-glow')
+      .attr('x', '-100%')
+      .attr('y', '-100%')
+      .attr('width', '300%')
+      .attr('height', '300%');
+
+    dangerGlowFilter.append('feGaussianBlur')
+      .attr('stdDeviation', '6')
+      .attr('result', 'coloredBlur');
+
+    const feFlood = dangerGlowFilter.append('feFlood')
+      .attr('flood-color', '#ff4444')
+      .attr('flood-opacity', '0.8');
+
+    dangerGlowFilter.append('feComposite')
+      .attr('in', 'SourceGraphic')
+      .attr('in2', 'flood')
+      .attr('operator', 'in')
+      .attr('result', 'innerShadow');
+
+    const feMerge2 = dangerGlowFilter.append('feMerge');
+    feMerge2.append('feMergeNode').attr('in', 'coloredBlur');
+    feMerge2.append('feMergeNode').attr('in', 'SourceGraphic');
 
     Object.entries(PROTOCOL_COLORS).forEach(([proto, color]) => {
       const gradient = this.defs.append('linearGradient')
@@ -185,6 +214,16 @@ export class TopologyGraph {
         return `translate(${x},${y})`;
       });
 
+    this.gPulse.selectAll('circle.pulse-ring')
+      .attr('cx', d => {
+        const pos = this.nodePositionMap.get(d.id);
+        return pos ? pos.x : d.x || 0;
+      })
+      .attr('cy', d => {
+        const pos = this.nodePositionMap.get(d.id);
+        return pos ? pos.y : d.y || 0;
+      });
+
     this.gLabel.selectAll('text.link-label')
       .attr('x', d => {
         const pos = this.linkPositionMap.get(d.id);
@@ -296,6 +335,8 @@ export class TopologyGraph {
     this._updateLinks();
     this._updateNodes();
     this._updateLabels();
+    this._updatePulseRings();
+    this._updateNodeStyles();
   }
 
   _updateLinks() {
@@ -536,6 +577,89 @@ export class TopologyGraph {
     this.onLinkClick = handler;
   }
 
+  setSuspiciousIps(suspiciousMap) {
+    this.suspiciousIps = new Map(Object.entries(suspiciousMap || {}));
+    this._updatePulseRings();
+    this._updateNodeStyles();
+  }
+
+  _startPulseAnimation() {
+    const animate = () => {
+      this.pulseTime += 0.05;
+      if (this.pulseTime > Math.PI * 2) {
+        this.pulseTime = 0;
+      }
+      this._updatePulseAnimation();
+      this.pulseAnimId = requestAnimationFrame(animate);
+    };
+    this.pulseAnimId = requestAnimationFrame(animate);
+  }
+
+  _updatePulseAnimation() {
+    if (this.suspiciousIps.size === 0) return;
+
+    const pulseScale = 1 + Math.sin(this.pulseTime) * 0.3 + 0.3;
+    const pulseOpacity = 0.6 + Math.sin(this.pulseTime + Math.PI) * 0.3;
+
+    this.gPulse.selectAll('circle.pulse-ring')
+      .attr('r', d => {
+        const node = this.nodeMap.get(d.id);
+        if (!node) return 10;
+        const baseR = this._getNodeRadius(node);
+        return baseR * pulseScale + 8;
+      })
+      .style('opacity', pulseOpacity);
+  }
+
+  _updatePulseRings() {
+    const suspiciousNodes = this.nodes.filter(n => this.suspiciousIps.has(n.id));
+
+    const pulse = this.gPulse.selectAll('circle.pulse-ring')
+      .data(suspiciousNodes, d => d.id);
+
+    pulse.exit().remove();
+
+    const pulseEnter = pulse.enter()
+      .append('circle')
+      .attr('class', 'pulse-ring')
+      .attr('fill', 'none')
+      .attr('stroke', '#ff4444')
+      .attr('stroke-width', 3)
+      .style('filter', 'url(#danger-glow)')
+      .style('opacity', 0.6);
+
+    pulseEnter.merge(pulse)
+      .attr('r', d => this._getNodeRadius(d) + 8);
+  }
+
+  _updateNodeStyles() {
+    this.gNode.selectAll('g.node').select('circle')
+      .attr('fill', d => {
+        if (this.suspiciousIps.has(d.id)) {
+          return '#ff4444';
+        }
+        return d.isInternal ? '#00d4ff' : '#8892a6';
+      })
+      .attr('stroke', d => {
+        if (this.suspiciousIps.has(d.id)) {
+          return '#ff0000';
+        }
+        return d.isInternal ? '#0099cc' : '#5a6478';
+      })
+      .attr('stroke-width', d => {
+        if (this.suspiciousIps.has(d.id)) {
+          return 4;
+        }
+        return 2;
+      })
+      .style('filter', d => {
+        if (this.suspiciousIps.has(d.id)) {
+          return 'url(#danger-glow)';
+        }
+        return 'url(#glow)';
+      });
+  }
+
   getStats() {
     return {
       nodeCount: this.nodes.length,
@@ -548,6 +672,9 @@ export class TopologyGraph {
   destroy() {
     if (this.renderFrameId) {
       cancelAnimationFrame(this.renderFrameId);
+    }
+    if (this.pulseAnimId) {
+      cancelAnimationFrame(this.pulseAnimId);
     }
     if (this.worker) {
       this.worker.postMessage({ type: 'stop' });

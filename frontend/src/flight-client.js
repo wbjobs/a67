@@ -21,7 +21,10 @@ export class FlowFlightClient {
       timeRange: [],
       streamStart: [],
       streamPage: [],
-      streamEnd: []
+      streamEnd: [],
+      anomalyUpdate: [],
+      anomalyStats: [],
+      anomalyThresholdUpdated: []
     };
     this._currentStream = null;
     this._pendingFlows = [];
@@ -167,6 +170,45 @@ export class FlowFlightClient {
     });
   }
 
+  async getAnomalyStats() {
+    return new Promise((resolve) => {
+      const msg = { action: 'get_anomaly_stats' };
+      this._send(msg);
+
+      const handler = (data) => {
+        this.off('anomalyStats', handler);
+        resolve(data);
+      };
+      this.once('anomalyStats', handler);
+
+      setTimeout(() => {
+        this.off('anomalyStats', handler);
+        resolve(null);
+      }, 3000);
+    });
+  }
+
+  async setAnomalyThreshold(params) {
+    return new Promise((resolve) => {
+      const msg = {
+        action: 'set_anomaly_threshold',
+        ...params
+      };
+      this._send(msg);
+
+      const handler = (data) => {
+        this.off('anomalyThresholdUpdated', handler);
+        resolve(data);
+      };
+      this.once('anomalyThresholdUpdated', handler);
+
+      setTimeout(() => {
+        this.off('anomalyThresholdUpdated', handler);
+        resolve(null);
+      }, 3000);
+    });
+  }
+
   _send(data) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
@@ -189,6 +231,12 @@ export class FlowFlightClient {
       this._handleStreamPage(message);
     } else if (message.type === 'stream_end') {
       this._handleStreamEnd(message);
+    } else if (message.type === 'anomaly_update') {
+      this._emit('anomalyUpdate', message.data);
+    } else if (message.type === 'anomaly_stats') {
+      this._emit('anomalyStats', message.data);
+    } else if (message.type === 'anomaly_threshold_updated') {
+      this._emit('anomalyThresholdUpdated', message.data);
     }
   }
 
